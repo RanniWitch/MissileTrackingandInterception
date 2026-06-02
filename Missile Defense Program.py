@@ -1,10 +1,12 @@
-#python "C:\Users\SaiPC\OneDrive\Documents\Missile Defense Program.py"
+#python "C:\Users\SaiPC\OneDrive\Documents\Missile Launch\Missile Defense Program.py"
+
 
 import numpy as np
 import matplotlib.pyplot as plt
 from filterpy.kalman import KalmanFilter
 
 
+print("RUNNING NEWEST VERSION")
 
 x = 0
 y = 1000
@@ -83,9 +85,47 @@ interceptor_y_history = []
 
 intercept_radius = 25
 
+#Navigation Constant
+N = 4
+
+#Line of Sight
+los_history = []
+
+previous_los_angle = np.arctan2(
+    kf.x[1, 0] - interceptor_y,
+    kf.x[0, 0] - interceptor_x
+)
+
+closing_velocity = interceptor_speed
+
+missile_heading = previous_los_angle
+
+plt.scatter(
+    [0],
+    [0],
+    marker="s",
+    s=100,
+    label="Launcher"
+)
+
+#target acceleration
+ax = 0
+ay = 0
+
+vx_history = []
+vy_history = []
+
+tracking_error_history = []
+
 for t in np.arange(0, totalTime, dt):
     xHistory.append(x)
     yHistory.append(y)
+
+    vx_history.append(vx)
+    vy_history.append(vy)
+
+    if t > 2:
+        ay = -15
 
     measuredX = x +np.random.normal(0, measurementSigma)
     measuredY = y +np.random.normal(0, measurementSigma)
@@ -93,10 +133,17 @@ for t in np.arange(0, totalTime, dt):
     measuredXhistory.append(measuredX)
     measuredYhistory.append(measuredY)
 
-    x = x + vx * dt
-    y = y + vy * dt
+    vx += ax * dt
+    vy += ay * dt
+
+    x += vx * dt
+    y += vy * dt
 
     kf.predict()
+
+    measurement = np.array([measuredX, measuredY])
+    kf.update(measurement)
+
     estimated_x_history.append(kf.x[0,0])
     estimated_y_history.append(kf.x[1,0])
 
@@ -106,20 +153,49 @@ for t in np.arange(0, totalTime, dt):
 
     distance = np.sqrt(dx**2 + dy**2)
 
-    if distance < intercept_radius:
-        print("Target intercepted!")
-        break
+    los_angle = np.arctan2(dy, dx)
+    # Wrap difference to [-pi, pi] to avoid spikes at angle boundaries
+    los_rate = np.arctan2(np.sin(los_angle - previous_los_angle), np.cos(los_angle - previous_los_angle)) / dt
+    previous_los_angle = los_angle
 
-    direction_x = dx / distance
-    direction_y = dy / distance
+    commanded_acceleration = (
+    N
+    * closing_velocity
+    * los_rate
+    )
 
-    interceptor_x += direction_x * interceptor_speed * dt
-    interceptor_y += direction_y * interceptor_speed * dt
+    missile_heading += (
+    commanded_acceleration
+    / interceptor_speed
+    ) * dt
+
+
+    interceptor_vx = interceptor_speed * np.cos(missile_heading)
+    interceptor_vy = interceptor_speed * np.sin(missile_heading)
+
+    interceptor_x += interceptor_vx * dt
+    interceptor_y += interceptor_vy * dt
 
     interceptor_x_history.append(interceptor_x)
     interceptor_y_history.append(interceptor_y)
 
-    
+    error = np.sqrt(
+        (x - kf.x[0,0])**2
+        +
+        (y - kf.x[1,0])**2
+    )
+
+    tracking_error_history.append(error)
+
+    if distance < intercept_radius:
+        print("Target intercepted!")
+        break
+
+    if len(interceptor_x_history) % 20 == 0:
+        print(
+        f"Heading={missile_heading:.3f}"
+    )
+
 
 print(interceptor_x, interceptor_y)
 print(len(interceptor_x_history))
@@ -131,13 +207,6 @@ plt.plot(
     yHistory, 
     label="True Trajectory"
 )
-
-measurement = np.array([
-    measuredX,
-    measuredY
-])
-
-kf.update(measurement)
 
 plt.scatter(
     measuredXhistory,
@@ -152,8 +221,6 @@ plt.plot(
     label="Kalman Estimate"
 )
 
-
-
 plt.xlabel("X Position (m)")
 plt.ylabel("Y Position (m)")
 plt.title("Target Tracking Simulation")
@@ -164,8 +231,28 @@ plt.plot(
     label="Interceptor"
 )
 
+plt.scatter(
+    [interceptor_x],
+    [interceptor_y],
+    marker="x",
+    s=100,
+    label="Intercept Point"
+)
+
+plt.xlabel("X Position (m)")
+plt.ylabel("Y Position (m)")
+plt.title("Target Tracking Simulation")
 #print ("Final True Y:", y)
 
 plt.legend()
 plt.grid(True)
 plt.show()
+
+plt.figure()
+
+plt.plot(tracking_error_history)
+
+plt.xlabel("Time Step")
+plt.ylabel("Tracking Error (m)")
+plt.title("Kalman Filter Tracking Error")
+plt.grid(True)
