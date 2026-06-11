@@ -1,7 +1,9 @@
 #python "C:\Users\SaiPC\OneDrive\Documents\Missile Launch\Missile Defense Program.py"
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.patches
 from filterpy.kalman import KalmanFilter
 from enum import Enum, auto
 
@@ -22,9 +24,11 @@ dt        = 0.04  # s
 totalTime = 200   # s
 NUM_RUNS  = 100
 
-# Target initial conditions
+# Target initial conditions — SRBM targeting the asset at 50km
+# Shallow loft angle (~30°) gives a realistic ballistic arc with the asset
+# in the predicted impact zone and a descending-arc intercept geometry.
 x0, y0   = 0.0, 0.0
-vx0, vy0 = 400.0, 700.0
+vx0, vy0 = 700.0, 400.0
 
 # PAC-3 Radar (AN/MPQ-65)
 # Tracking accuracy ~15m 1-sigma at typical engagement ranges
@@ -32,10 +36,14 @@ measurementSigma = 15.0  # m
 
 # PAC-3 Interceptor (MIM-104F)
 # Max speed ~Mach 5 (~1700 m/s), hit-to-kill warhead
-interceptor_speed = 1700.0  # m/s
-intercept_radius  = 10.0    # m — hit-to-kill requires ~5-10m
-N_pn              = 4       # PN constant — PAC-3 uses augmented PN ~4-5
-max_accel         = 300.0   # m/s² — PAC-3 ~30g lateral
+# Battery is co-located with the defended asset
+interceptor_speed  = 1700.0  # m/s
+interceptor_x0     = 45000.0 # m — PAC-3 battery position (5km short of asset)
+interceptor_y0     = 0.0     # m
+intercept_radius   = 34.0    # m — half a timestep at 1700m/s (1700*0.04/2); ensures
+                              #     closest approach between frames is not missed
+N_pn               = 4       # PN constant — PAC-3 uses augmented PN ~4-5
+max_accel          = 300.0   # m/s² — PAC-3 ~30g lateral
 
 # Engagement state machine
 # Models the real PAC-3 engagement timeline:
@@ -84,15 +92,68 @@ def predict_ground_impact(px, py, pvx, pvy):
 
 def predict_intercept_point(int_x, int_y, int_speed,
                             tgt_x, tgt_y, tgt_vx, tgt_vy,
-                            search_steps=500, max_tof=60.0):
+                            search_steps=1000, max_tof=150.0):
+    # Find the point where the interceptor and target arrive at the same time.
+    # Condition: dist(interceptor, future_target_pos) / int_speed == tau
+    # i.e. the interceptor flies straight there and arrives exactly when the target does.
+    # We also require the target to be on its descending arc (vy_at_tau < 0).
+    best_fx, best_fy = tgt_x, tgt_y
+    best_err = 1e9
     for tau in np.linspace(0.1, max_tof, search_steps):
         fx, fy = ballistic_position(tgt_x, tgt_y, tgt_vx, tgt_vy, tau)
         if fy < 0:
             break
+        vy_at_tau = tgt_vy - g * tau
+        if vy_at_tau >= 0:
+            continue  # target still ascending — only intercept on descent
         dist = np.sqrt((fx - int_x)**2 + (fy - int_y)**2)
-        if dist / tau <= int_speed:
+        tof = dist / int_speed      # time for interceptor to fly straight to that point
+        err = abs(tof - tau)        # how well the arrival times match
+        if err < best_err:
+            best_err = err
+            best_fx, best_fy = fx, fy
+        if err < 0.5:               # within 0.5s timing accuracy — good enough
             return fx, fy
-    return tgt_x, tgt_y
+    return best_fx, best_fy
+
+
+def compute_launch_time(int_x, int_y, int_speed,
+                        tgt_x, tgt_y, tgt_vx, tgt_vy,
+                        current_t, search_steps=2000, max_tof=150.0):
+    """
+    Find the intercept point on the descending arc and return:
+      - the absolute time to launch (current_t + delay)
+      - the aim point (fx, fy)
+    Strategy: scan the target's future positions on the descending arc,
+    find the one where dist/speed == time_until_target_arrives.
+    The interceptor should launch at (current_t + tau - tof).
+    Returns (launch_time, aim_x, aim_y).
+    """
+    best = None
+    best_err = 1e9
+    for tau in np.linspace(0.1, max_tof, search_steps):
+        fx, fy = ballistic_position(tgt_x, tgt_y, tgt_vx, tgt_vy, tau)
+        if fy < 0:
+            break
+        vy_at_tau = tgt_vy - g * tau
+        if vy_at_tau >= 0:
+            continue  # ascending — skip
+        dist  = np.sqrt((fx - int_x)**2 + (fy - int_y)**2)
+        tof   = dist / int_speed           # interceptor flight time to that point
+        t_launch_needed = current_t + tau - tof   # absolute time to fire
+        if t_launch_needed < current_t:
+            continue  # would need to have launched in the past
+        err = abs(tof - tau)  # timing residual (should approach 0 at the solution)
+        if err < best_err:
+            best_err = err
+            best = (t_launch_needed, fx, fy, tof)
+        # Good enough — within half a second timing accuracy
+        if err < 0.5:
+            break
+    if best:
+        return best[0], best[1], best[2]
+    # Fallback: launch now, aim at current target position
+    return current_t, tgt_x, tgt_y
 
 
 def make_kf():
@@ -151,15 +212,15 @@ def run_tests():
     check("Impact prediction handles underground position (returns None)",
           ix is None and it is None)
 
-    # 4. Intercept point search finds a reachable point
+    # 4. Intercept point search finds a reachable point on the descending arc
     aim_x, aim_y = predict_intercept_point(
-        0, 0, interceptor_speed, x0, y0, vx0, vy0)
+        interceptor_x0, interceptor_y0, interceptor_speed, x0, y0, vx0, vy0)
     check("Intercept point is above ground",
           aim_y >= 0,
           f"aim_y={aim_y:.1f}m")
     check("Intercept point is reachable at interceptor speed",
-          np.sqrt(aim_x**2 + aim_y**2) / interceptor_speed <= 60.0,
-          f"range={np.sqrt(aim_x**2+aim_y**2):.0f}m, speed={interceptor_speed}m/s")
+          np.sqrt((aim_x - interceptor_x0)**2 + (aim_y - interceptor_y0)**2) / interceptor_speed <= 150.0,
+          f"range={np.sqrt((aim_x-interceptor_x0)**2+(aim_y-interceptor_y0)**2):.0f}m, speed={interceptor_speed}m/s")
 
     # 5. Kalman filter initialises correctly
     kf_test = make_kf()
@@ -222,17 +283,22 @@ for run in range(NUM_RUNS):
     prev_vy = vy
     kf = make_kf()
 
-    # Interceptor state
-    int_x, int_y    = 0.0, 0.0
-    int_active      = False
-    missile_heading = 0.0
-    prev_los_angle  = 0.0
+    # Interceptor state — battery is near the defended asset, not at the launch site
+    int_x, int_y      = interceptor_x0, interceptor_y0
+    int_active        = False
+    missile_heading   = 0.0
+    prev_los_angle    = 0.0
+    aim_x, aim_y      = 0.0, 0.0   # predicted intercept point (updated in midcourse)
+    aim_update_t      = -999.0      # time of last aim point refresh
+    terminal_phase    = False       # latched True once interceptor enters terminal PN
+    scheduled_launch_t = None       # computed optimal launch time (set at AUTHORIZED)
 
     # Engagement state machine
-    eng_state     = EngagementState.SEARCHING
-    state_entry_t = 0.0   # time when current state was entered
-    launch_t      = None  # time interceptor actually fired
-    iff_blocked   = False # did IFF misclassification prevent engagement
+    eng_state          = EngagementState.SEARCHING
+    state_entry_t      = 0.0   # time when current state was entered
+    launch_t           = None  # time interceptor actually fired
+    iff_blocked        = False  # did IFF misclassification prevent engagement
+    scheduled_launch_t = None  # optimal launch time computed at AUTHORIZED
 
     # Event flags
     apogee_reached     = False
@@ -337,20 +403,29 @@ for run in range(NUM_RUNS):
                     break
 
         elif eng_state == EngagementState.AUTHORIZED:
-            # Short delay for interceptor readiness check then fire
-            if time_in_state >= AUTHORIZATION_DURATION:
-                eng_state     = EngagementState.INTERCEPTOR_AWAY
-                state_entry_t = t
-                launch_t      = t
-                int_active    = True
-                state_history.append((t, "INTERCEPTOR_AWAY"))
-
-                aim_x, aim_y = predict_intercept_point(
+            # Fire control has authorised the shot.
+            # Compute the optimal launch time so the interceptor arrives at the
+            # descending-arc intercept point at the same moment as the target.
+            # Hold the interceptor on the rail until that time — then fire.
+            if time_in_state >= AUTHORIZATION_DURATION and scheduled_launch_t is None:
+                scheduled_launch_t, aim_x, aim_y = compute_launch_time(
                     int_x, int_y, interceptor_speed,
-                    kf.x[0,0], kf.x[1,0], kf.x[2,0], kf.x[3,0]
+                    kf.x[0,0], kf.x[1,0], kf.x[2,0], kf.x[3,0],
+                    current_t=t
                 )
-                prev_los_angle  = np.arctan2(aim_y - int_y, aim_x - int_x)
-                missile_heading = prev_los_angle
+                state_history.append((t, f"LAUNCH SCHEDULED for t={scheduled_launch_t:.1f}s  aim=({aim_x:.0f},{aim_y:.0f})"))
+
+            if scheduled_launch_t is not None and t >= scheduled_launch_t:
+                eng_state      = EngagementState.INTERCEPTOR_AWAY
+                state_entry_t  = t
+                launch_t       = t
+                int_active     = True
+                # Point directly at the aim point at the moment of launch
+                missile_heading = np.arctan2(aim_y - int_y, aim_x - int_x)
+                prev_los_angle  = missile_heading
+                aim_update_t    = t
+                terminal_phase  = False
+                state_history.append((t, "INTERCEPTOR_AWAY"))
 
         # Guidance (only when interceptor is away)
         if int_active:
@@ -358,40 +433,65 @@ for run in range(NUM_RUNS):
             tdy = kf.x[1,0] - int_y
             dist_to_target = np.sqrt(tdx**2 + tdy**2)
 
-            if dist_to_target > 3000:
-                # Midcourse -- steer toward predicted intercept point
-                aim_x, aim_y = predict_intercept_point(
-                    int_x, int_y, interceptor_speed,
-                    kf.x[0,0], kf.x[1,0], kf.x[2,0], kf.x[3,0]
-                )
+            # Distance to the aim point — this is what controls phase switching,
+            # NOT distance to the current target position.
+            adx = aim_x - int_x
+            ady = aim_y - int_y
+            dist_to_aim = np.sqrt(adx**2 + ady**2)
+
+            los_angle = np.arctan2(tdy, tdx)
+
+            # Switch to terminal PN when interceptor is within 5km of the aim point
+            # AND the target is within 6km — ensures PN activates only when
+            # both the interceptor and target are converging on the same point.
+            if dist_to_aim < 5000.0 and dist_to_target < 6000.0:
+                terminal_phase = True
+
+            if not terminal_phase:
+                # ---- MIDCOURSE ----
+                # Steer toward the predicted intercept point (aim_x, aim_y).
+                # Refresh the aim point every 2s using the latest KF estimate so
+                # it stays accurate as the target progresses along its arc.
+                if t - aim_update_t >= 2.0:
+                    aim_x, aim_y = predict_intercept_point(
+                        int_x, int_y, interceptor_speed,
+                        kf.x[0,0], kf.x[1,0], kf.x[2,0], kf.x[3,0]
+                    )
+                    aim_update_t = t
+
+                # Heading error toward aim point (not toward current target).
                 desired_heading = np.arctan2(aim_y - int_y, aim_x - int_x)
                 heading_error   = np.arctan2(
                     np.sin(desired_heading - missile_heading),
                     np.cos(desired_heading - missile_heading)
                 )
-                turn_rate = np.clip(
-                    heading_error / dt,
-                    -max_accel / interceptor_speed,
-                    max_accel / interceptor_speed
-                )
-                missile_heading += turn_rate * dt
+                # Turn budget per timestep = max lateral accel / speed * dt.
+                # Clipping the angle directly (not dividing by dt) prevents
+                # the sustained max-rate turning that caused the loop.
+                max_turn_per_step = (max_accel / interceptor_speed) * dt
+                missile_heading  += np.clip(heading_error, -max_turn_per_step, max_turn_per_step)
+
             else:
-                # Terminal -- PN guidance directly against the target
-                los_angle = np.arctan2(tdy, tdx)
+                # ---- TERMINAL PN ----
+                # Pure proportional navigation against the actual target.
+                # LOS rate = how fast the line-of-sight angle is rotating.
+                # PN command = N * closing_velocity * LOS_rate (classic PN law).
+                # This is model-free — works for any target motion.
                 los_rate  = np.arctan2(
                     np.sin(los_angle - prev_los_angle),
                     np.cos(los_angle - prev_los_angle)
                 ) / dt
-                int_vx_now = interceptor_speed * np.cos(missile_heading)
-                int_vy_now = interceptor_speed * np.sin(missile_heading)
-                rel_vx = kf.x[2,0] - int_vx_now
-                rel_vy = kf.x[3,0] - int_vy_now
+                int_vx_now  = interceptor_speed * np.cos(missile_heading)
+                int_vy_now  = interceptor_speed * np.sin(missile_heading)
+                rel_vx      = kf.x[2,0] - int_vx_now
+                rel_vy      = kf.x[3,0] - int_vy_now
                 closing_vel = -(tdx * rel_vx + tdy * rel_vy) / max(dist_to_target, 1e-3)
-                Vc = max(closing_vel, interceptor_speed * 0.1)
-                cmd_accel = np.clip(N_pn * Vc * los_rate, -max_accel, max_accel)
+                Vc          = max(closing_vel, interceptor_speed * 0.1)
+                cmd_accel   = np.clip(N_pn * Vc * los_rate, -max_accel, max_accel)
                 missile_heading += (cmd_accel / interceptor_speed) * dt
 
-            prev_los_angle = np.arctan2(tdy, tdx)
+            # Always update LOS history for smooth PN on phase transition
+            prev_los_angle = los_angle
 
             int_vx = interceptor_speed * np.cos(missile_heading)
             int_vy = interceptor_speed * np.sin(missile_heading)
@@ -399,7 +499,9 @@ for run in range(NUM_RUNS):
             int_y += int_vy * dt
             int_xH.append(int_x); int_yH.append(int_y)
 
-            # Kill check
+            # Kill check against true target position.
+            # intercept_radius is set to half a timestep of travel (1700 * 0.04 / 2 = 34m)
+            # to ensure we don't step over the closest approach point between frames.
             if np.sqrt((x - int_x)**2 + (y - int_y)**2) < intercept_radius:
                 intercepted   = True
                 intercept_idx = len(xH)
@@ -463,6 +565,9 @@ if last.get('launch_t'):
     print(f"  Total engagement latency: {last['launch_t']:.2f} s")
 if last.get('iff_blocked'):
     print("  Engagement blocked by IFF misclassification")
+if last.get('intercepted'):
+    print(f"  Intercept point:  x={last['int_x']:.0f} m,  y={last['int_y']:.0f} m")
+    print(f"  Intercept altitude: {last['int_y']:.0f} m  ({last['int_y']/1000:.2f} km)")
 
 
 # Last-run trajectory plot
@@ -483,10 +588,14 @@ if last['int_xH']:
             label="PAC-3 Interceptor")
     ax.scatter([last['int_x']], [last['int_y']], marker="x", s=150,
                color="red", zorder=5, label="Final Interceptor Position")
+    ax.scatter([interceptor_x0], [interceptor_y0], marker="^", s=150,
+               color="red", zorder=5, label="PAC-3 Battery")
 
 if last['apogee_reached']:
-    idx = min(int(last['apogee_t'] / dt), len(plot_xH) - 1)
-    ax.scatter([plot_xH[idx]], [plot_yH[idx]], marker="^", s=150,
+    # Use full xH/yH (not the intercept-truncated plot arrays) so the apogee
+    # marker is always drawn at the correct position on the arc.
+    idx = min(int(last['apogee_t'] / dt), len(last['xH']) - 1)
+    ax.scatter([last['xH'][idx]], [last['yH'][idx]], marker="^", s=150,
                color="purple", zorder=5,
                label=f"Apogee ({last['apogee_alt']:.0f} m)")
 
@@ -495,10 +604,13 @@ if last['predicted_impact_x']:
                color="orange", zorder=5,
                label=f"Predicted Impact ({last['predicted_impact_x']:.0f} m)")
 
-asset_circle = plt.Circle((asset_x, asset_y), asset_threat_radius,
-                           color="blue", fill=False, linestyle="--",
-                           linewidth=1.5,
-                           label=f"Defended Area ({asset_threat_radius/1000:.0f}km radius)")
+asset_circle = matplotlib.patches.Wedge(
+    (asset_x, asset_y), asset_threat_radius,
+    theta1=0, theta2=180,          # upper half only — ground is not defended
+    facecolor="blue", alpha=0.15,
+    edgecolor="blue", linewidth=1.5,
+    label=f"Defended Area ({asset_threat_radius/1000:.0f}km radius)"
+)
 ax.add_patch(asset_circle)
 ax.scatter([asset_x], [asset_y], marker="D", s=120, color="blue",
            zorder=5, label="Defended Asset")
